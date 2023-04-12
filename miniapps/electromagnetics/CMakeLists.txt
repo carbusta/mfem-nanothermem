@@ -33,6 +33,12 @@ if (MFEM_USE_MPI)
    maxwell_solver.cpp
    EXTRA_HEADERS maxwell_solver.hpp ${MFEM_MINIAPPS_COMMON_HEADERS}
    LIBRARIES mfem mfem-common)
+   
+ add_mfem_miniapp(nanothermem
+   MAIN nanothermem.cpp
+   nanothermem_solver.cpp
+   EXTRA_HEADERS nanothermem_solver.hpp ${MFEM_MINIAPPS_COMMON_HEADERS}
+   LIBRARIES mfem mfem-common)
 
   # Add the corresponding tests to the "test" target
   if (MFEM_ENABLE_TESTING)

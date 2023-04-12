@@ -13,230 +13,159 @@
 #define MFEM_NANOTHERMEM_SOLVER
 
 #include "../common/pfem_extras.hpp"
+#include "../common/mesh_extras.hpp"
+#include "electromagnetics.hpp"
 
 #ifdef MFEM_USE_MPI
 
-#include <memory>
-#include <iostream>
-#include <fstream>
+#include <string>
+#include <map>
+
+using namespace std;
+using namespace mfem;
 
 namespace mfem
 {
 
+using common::ND_ParFESpace;
+using common::RT_ParFESpace;
+using common::ParDiscreteCurlOperator;
+
 namespace electromagnetics
 {
 
-// Some global variable for convenience
-const double       SOLVER_TOL = 1.0e-9;
-const int       SOLVER_MAX_IT = 1000;
-// Initialized in nanothermem.cpp and used in nanothermem_solver.cpp:
-extern int SOLVER_PRINT_LEVEL;
-extern int        STATIC_COND;
-
-// These are defined in nanothermem.cpp
-void edot_bc(const Vector &x, Vector &E);
-void e_exact(const Vector &x, double t, Vector &E);
-void b_exact(const Vector &x, double t, Vector &B);
-double p_bc(const Vector &x, double t);
-double t_exact(const Vector &x);
-
-// A Coefficient is an object with a function Eval that returns a double.  A
-// MeshDependentCoefficient returns a different value depending upon the given
-// mesh attribute, i.e. a "material property".
-// Somewhat inefficiently, this is achieved using a GridFunction.
-class MeshDependentCoefficient: public Coefficient
+class NanoThermEMSolver : public TimeDependentOperator
 {
+public:
+   NanoThermEMSolver(ParMesh & pmesh, int sOrder,
+                 double (*eps     )(const Vector&),
+                 double (*muInv   )(const Vector&),
+                 double (*sigma   )(const Vector&),
+                 void   (*j_src   )(const Vector&, double, Vector&),
+                 Array<int> & abcs, Array<int> & dbcs,
+                 void   (*dEdt_bc )(const Vector&, double, Vector&));
+
+   ~NanoThermEMSolver();
+
+   int GetLogging() const { return logging_; }
+   void SetLogging(int logging) { logging_ = logging; }
+
+   HYPRE_BigInt GetProblemSize();
+
+   void PrintSizes();
+
+   void SetInitialEField(VectorCoefficient & EFieldCoef);
+   void SetInitialBField(VectorCoefficient & BFieldCoef);
+
+   void Mult(const Vector &B, Vector &dEdt) const;
+
+   void ImplicitSolve(const double dt, const Vector &x, Vector &k);
+
+   double GetMaximumTimeStep() const;
+
+   double GetEnergy() const;
+
+   Operator & GetNegCurl() { return *NegCurl_; }
+
+   Vector & GetEField() { return *E_; }
+   Vector & GetBField() { return *B_; }
+
+   void SyncGridFuncs();
+
+   void RegisterVisItFields(VisItDataCollection & visit_dc);
+
+   void WriteVisItFields(int it = 0);
+
+   void InitializeGLVis();
+
+   void DisplayToGLVis();
+
 private:
-   std::map<int, double> *materialMap;
-   double scaleFactor;
-public:
-   MeshDependentCoefficient(const std::map<int, double> &inputMap,
-                            double scale = 1.0);
-   MeshDependentCoefficient(const MeshDependentCoefficient &cloneMe);
-   virtual double Eval(ElementTransformation &T, const IntegrationPoint &ip);
-   void SetScaleFactor(const double &scale) { scaleFactor = scale; }
-   virtual ~MeshDependentCoefficient()
-   {
-      if (materialMap != NULL) { delete materialMap; }
-   }
-};
 
-// This Coefficient is a product of a GridFunction and MeshDependentCoefficient
-// for example if T (temperature) is a GridFunction and c (heat capacity) is a
-// MeshDependentCoefficient, this function can compute c*T.
-class ScaledGFCoefficient: public GridFunctionCoefficient
-{
-private:
-   MeshDependentCoefficient mdc;
-public:
-   ScaledGFCoefficient(GridFunction *gf, MeshDependentCoefficient &input_mdc);
-   virtual double Eval(ElementTransformation &T, const IntegrationPoint &ip);
-   void SetMDC(const MeshDependentCoefficient &input_mdc) { mdc = input_mdc; }
-   virtual ~ScaledGFCoefficient() {}
-};
+   // This method alters mutable member data
+   void setupSolver(const int idt, const double dt) const;
 
-/**
-   After spatial discretization, the magnetic diffusion equation can be written
-   as a system of ODEs:
+   void implicitSolve(const double dt, const Vector &x, Vector &k) const;
 
-      S0(sigma) P = 0
-      dE/dt       = - (M1(sigma) + dt S1(1/mu))^{-1}*(S1(1/mu)*E + sigma Grad P)
-      dB/dt       = - Curl(E)
-      dF/dt       = (M2(c/k) + dt S2(1))^{-1} (-S2(1) F + Div J)
-      dcT/dt      = -Div F + J
+   int myid_;
+   int num_procs_;
+   int order_;
+   int logging_;
 
-   where
+   bool lossy_;
 
-     P is the 0-form electrostatic potential,
-     E is the 1-form electric field,
-     B is the 2-form magnetic flux,
-     F is the 2-form thermal flux,
-     T is the 3-form temperature.
-     M is the mass matrix,
-     S is the stiffness matrix,
-     Curl is the curl matrix,
-     Div is the divergence matrix,
-     sigma is the electrical conductivity,
-     k is the thermal conductivity,
-     c is the heat capacity,
-     J is a function of the Joule heating sigma (E dot E).
+   double dtMax_;   // Maximum stable time step
+   double dtScale_; // Used to scale dt before converting to an integer
 
-   Class MagneticDiffusionEOperator represents the right-hand side of the above
-   system of ODEs.
-*/
-class MagneticDiffusionEOperator : public TimeDependentOperator
-{
-protected:
-   // These ParFiniteElementSpace objects provide degree-of-freedom mappings.
-   // To create these you must provide the mesh and the definition of the FE
-   // space. These objects are used to create hypre vectors to store the DOFs,
-   // they are used to create grid functions to perform FEM interpolation, and
-   // they are used by bilinear forms.
-   ParFiniteElementSpace &L2FESpace;
-   ParFiniteElementSpace &HCurlFESpace;
-   ParFiniteElementSpace &HDivFESpace;
-   ParFiniteElementSpace &HGradFESpace;
+   ParMesh * pmesh_;
 
-   // ParBilinearForms are used to create sparse matrices representing discrete
-   // linear operators.
-   ParBilinearForm *a0, *a1, *a2, *m1, *m2, *m3, *s1, *s2;
-   ParDiscreteLinearOperator *grad, *curl;
-   ParMixedBilinearForm *weakDiv, *weakDivC, *weakCurl;
+   ND_ParFESpace * HCurlFESpace_;
+   RT_ParFESpace * HDivFESpace_;
 
-   // Hypre matrices and vectors for 1-form systems A1 X1 = B1 and 2-form
-   // systems A2 = X2 = B2
-   HypreParMatrix *A0, *A1, *A2, *M1, *M2, *M3;
-   Vector *X0, *X1, *X2, *B0, *B1, *B2, *B3;
+   ParBilinearForm * hDivMassMuInv_;
+   ParBilinearForm * hCurlLosses_;
+   ParMixedBilinearForm * weakCurlMuInv_;
 
-   // temporary work vectors
-   ParGridFunction *v0, *v1, *v2;
+   ParDiscreteCurlOperator * Curl_;
 
-   // HypreSolver is derived from Solver, which is derived from Operator. So a
-   // HypreSolver object has a Mult() operator, which is actually the solver
-   // operation y = A^-1 x i.e. multiplication by A^-1.
-   // HyprePCG is a wrapper for hypre's preconditioned conjugate gradient.
-   mutable HypreSolver * amg_a0;
-   mutable HyprePCG    * pcg_a0;
-   mutable HypreSolver * ads_a2;
-   mutable HyprePCG    * pcg_a2;
-   mutable HypreSolver * ams_a1;
-   mutable HyprePCG    * pcg_a1;
-   mutable HypreSolver * dsp_m3;
-   mutable HyprePCG    * pcg_m3;
-   mutable HypreSolver * dsp_m1;
-   mutable HyprePCG    * pcg_m1;
-   mutable HypreSolver * dsp_m2;
-   mutable HyprePCG    * pcg_m2;
+   ParGridFunction * e_;    // Electric Field (HCurl)
+   ParGridFunction * b_;    // Magnetic Flux (HDiv)
+   ParGridFunction * j_;    // Volumetric Current Density (HCurl)
+   ParGridFunction * dedt_; // Time Derivative of Electric Field (HCurl)
+   ParGridFunction * rhs_;  // Dual of displacement current, rhs vector (HCurl)
+   ParLinearForm   * jd_;   // Dual of current density (HCurl)
 
-   mutable Array<int> ess_bdr;
-   mutable Array<int> ess_bdr_vdofs;
-   mutable Array<int> thermal_ess_bdr;
-   mutable Array<int> thermal_ess_bdr_vdofs;
-   mutable Array<int> poisson_ess_bdr;
-   mutable Array<int> poisson_ess_bdr_vdofs;
+   HypreParMatrix * M1Losses_;
+   HypreParMatrix * M2MuInv_;
+   HypreParMatrix * NegCurl_;
+   HypreParMatrix * WeakCurlMuInv_;
+   HypreParVector * E_; // Current value of the electric field DoFs
+   HypreParVector * B_; // Current value of the magnetic flux DoFs
+   mutable HypreParVector * HD_; // Used in energy calculation
+   mutable HypreParVector * RHS_;
 
-   MeshDependentCoefficient *sigma, *Tcapacity, *InvTcap, *InvTcond;
-   double mu, dt_A1, dt_A2;
+   Coefficient       * epsCoef_;    // Electric Permittivity Coefficient
+   Coefficient       * muInvCoef_;  // Magnetic Permeability Coefficient
+   Coefficient       * sigmaCoef_;  // Electric Conductivity Coefficient
+   Coefficient       * etaInvCoef_; // Admittance Coefficient
+   VectorCoefficient * eCoef_;      // Initial Electric Field
+   VectorCoefficient * bCoef_;      // Initial Magnetic Flux
+   VectorCoefficient * jCoef_;      // Time dependent current density
+   VectorCoefficient * dEdtBCCoef_; // Time dependent boundary condition
 
-   // The method builA2 creates the ParBilinearForm a2, the HypreParMatrix A2,
-   // and the solver and preconditioner pcg_a2 and amg_a2. The other build
-   // functions do similar things.
-   void buildA0(MeshDependentCoefficient &sigma);
-   void buildA1(double muInv, MeshDependentCoefficient &sigma, double dt);
-   void buildA2(MeshDependentCoefficient &InvTcond,
-                MeshDependentCoefficient &InvTcap, double dt);
-   void buildM1(MeshDependentCoefficient &sigma);
-   void buildM2(MeshDependentCoefficient &alpha);
-   void buildM3(MeshDependentCoefficient &Tcap);
-   void buildS1(double muInv);
-   void buildS2(MeshDependentCoefficient &alpha);
-   void buildGrad();
-   void buildCurl(double muInv);
-   void buildDiv( MeshDependentCoefficient &InvTcap);
+   double (*eps_    )(const Vector&);
+   double (*muInv_  )(const Vector&);
+   double (*sigma_  )(const Vector&);
+   void   (*j_src_  )(const Vector&, double, Vector&);
 
-public:
-   MagneticDiffusionEOperator(int len,
-                              ParFiniteElementSpace &L2FES,
-                              ParFiniteElementSpace &HCurlFES,
-                              ParFiniteElementSpace &HDivFES,
-                              ParFiniteElementSpace &HGradFES,
-                              Array<int> &ess_bdr,
-                              Array<int> &thermal_ess_bdr,
-                              Array<int> &poisson_ess_bdr,
-                              double mu,
-                              std::map<int, double> sigmaAttMap,
-                              std::map<int, double> TcapacityAttMap,
-                              std::map<int, double> InvTcapAttMap,
-                              std::map<int, double> InvTcondAttMap
-                             );
+   // Array of 0's and 1's marking the location of absorbing surfaces
+   Array<int> abc_marker_;
 
-   // Initialize the fields. This is where restart would go to.
-   void Init(Vector &vx);
+   // Array of 0's and 1's marking the location of Dirichlet boundaries
+   Array<int> dbc_marker_;
+   void   (*dEdt_bc_)(const Vector&, double, Vector&);
 
-   // class TimeDependentOperator is derived from Operator, and class Operator
-   // has the virtual function Mult(x,y) which computes y = A x for some matrix
-   // A, or more generally a nonlinear operator y = A(x).
-   virtual void Mult(const Vector &vx, Vector &dvx_dt) const;
+   // Dirichlet degrees of freedom
+   Array<int>   dbc_dofs_;
 
-   // Solve the Backward-Euler equation: k = f(x + dt*k, t), for the unknown
-   // slope k. This is the only requirement for high-order SDIRK implicit
-   // integration. This is a virtual function of class TimeDependentOperator.
-   virtual void ImplicitSolve(const double dt, const Vector &x, Vector &k);
+   // High order symplectic integration requires partial time steps of differing
+   // lengths. If losses are present the system matrix includes a portion scaled
+   // by the time step. Consequently, high order time integration requires
+   // different system matrices. The following maps contain various objects that
+   // depend on the time step.
+   mutable std::map<int, ParBilinearForm *> a1_;
+   mutable std::map<int, HypreParMatrix  *> A1_;
+   mutable std::map<int, Coefficient     *> dtCoef_;
+   mutable std::map<int, Coefficient     *> dtSigmaCoef_;
+   mutable std::map<int, Coefficient     *> dtEtaInvCoef_;
+   mutable std::map<int, HypreDiagScale  *> diagScale_;
+   mutable std::map<int, HyprePCG        *> pcg_;
 
-   // Compute B^T M2 B, where M2 is the HDiv mass matrix with permeability
-   // coefficient.
-   // double MagneticEnergy(ParGridFunction &B_gf) const;
+   // Data collection used to write VisIt files
+   VisItDataCollection * visit_dc_;
 
-   // Compute E^T M1 E, where M1 is the HCurl mass matrix with conductivity
-   // coefficient.
-   double ElectricLosses(ParGridFunction &E_gf) const;
-
-   // E is the input, w is the output which is L2 heating.
-   void GetJouleHeating(ParGridFunction &E_gf, ParGridFunction &w_gf) const;
-
-   void SetTime(const double t_);
-
-   // Write all the hypre matrices and vectors to disk.
-   void Debug(const char *basefilename, double time);
-
-   virtual ~MagneticDiffusionEOperator();
-};
-
-// A Coefficient is an object with a function Eval that returns a double. The
-// JouleHeatingCoefficient object will contain a reference to the electric field
-// grid function, and the conductivity sigma, and returns sigma E dot E at a
-// point.
-class JouleHeatingCoefficient: public Coefficient
-{
-private:
-   ParGridFunction &E_gf;
-   MeshDependentCoefficient sigma;
-public:
-   JouleHeatingCoefficient(const MeshDependentCoefficient &sigma_,
-                           ParGridFunction &E_gf_)
-      : E_gf(E_gf_), sigma(sigma_) {}
-   virtual double Eval(ElementTransformation &T, const IntegrationPoint &ip);
-   virtual ~JouleHeatingCoefficient() {}
+   // Sockets used to communicate with GLVis
+   std::map<std::string, socketstream*> socks_;
 };
 
 } // namespace electromagnetics
@@ -245,4 +174,4 @@ public:
 
 #endif // MFEM_USE_MPI
 
-#endif // MFEM_JOULE_SOLVER
+#endif // MFEM_NANOTHERMEM_SOLVER
